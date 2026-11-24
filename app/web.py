@@ -6,14 +6,16 @@
 """
 from __future__ import annotations
 
+import hashlib
 import os
 from typing import Optional, Tuple
 
 from flask import (
     Flask, flash, redirect, render_template, request, url_for,
 )
+from itsdangerous import BadSignature, URLSafeSerializer
 
-from . import csvutil, db
+from . import csvutil, db, merge
 from .solver import (
     CertRequirement, FurnaceBatchLink, FurnaceInput, SolveError, TransferInput,
     solve_allocation,
@@ -24,6 +26,10 @@ def create_app() -> Flask:
     app = Flask(__name__)
     app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024
     app.config["SECRET_KEY"] = os.environ.get("AUDIT_SECRET_KEY", "dev-audit-secret")
+    # 合账试算依据令牌：试算页签发、提交时验真，防止试算期间数据被改动后误提交。
+    basis_serializer = URLSafeSerializer(
+        app.config["SECRET_KEY"], salt="merge-basis-v1"
+    )
 
     conn = db.get_conn()
     db.init_db(conn)
@@ -75,6 +81,40 @@ def create_app() -> Flask:
         finally:
             log_conn.close()
 
+    def _merged_solver_inputs(merged: merge.MergedLedger, conn):
+        """把合并账（内存）转成求解器输入；转料行号用顺序合成 id。"""
+        f_inputs = [
+            FurnaceInput(f.code, f.primary_kg, f.recycled_kg)
+            for f in merged.furnaces
+        ]
+        links = [
+            FurnaceBatchLink(b.furnace, b.code, b.weight_kg)
+            for b in merged.batches
+        ]
+        t_inputs = [
+            TransferInput(i + 1, t.src, t.dst, t.weight_kg)
+            for i, t in enumerate(merged.transfers)
+        ]
+        reqs = [
+            CertRequirement(r["batch_code"], r["min_recycled_kg"])
+            for r in db.active_certificates(conn)
+        ]
+        return f_inputs, links, t_inputs, reqs
+
+    def _load_supplement_views(conn, ledger_id: int):
+        """组装首页暂存补报展示数据。"""
+        views = []
+        for row in db.list_supplements(conn, ledger_id):
+            sf = db.supplement_furnace(conn, row["id"])
+            views.append({
+                "row": row,
+                "primary_kg": sf["primary_kg"],
+                "recycled_kg": sf["recycled_kg"],
+                "batches": db.supplement_batches(conn, row["id"]),
+                "transfers": db.supplement_transfers(conn, row["id"]),
+            })
+        return views
+
     # ------------------------------------------------------------------
     @app.route("/")
     def index():
@@ -107,6 +147,12 @@ def create_app() -> Flask:
             logs = conn.execute(
                 "SELECT * FROM audit_log ORDER BY id DESC LIMIT 15"
             ).fetchall()
+
+            # 现行账套的暂存补报（只对现行账套展示上传入口与合账操作）
+            supp_views = (
+                _load_supplement_views(conn, ledger_id) if ledger_id else []
+            )
+            supp_codes = {v["row"]["furnace_code"] for v in supp_views}
 
             cert_map = {c["batch_code"]: c for c in certs if c["active"]}
             sol_batch_map = {r["batch_code"]: r["recycled_kg"] for r in sol_batches}
@@ -145,6 +191,8 @@ def create_app() -> Flask:
                 sol_batch_map=sol_batch_map,
                 sol_transfer_map=sol_transfer_map,
                 logs=logs,
+                supp_views=supp_views,
+                supp_codes=supp_codes,
             )
         finally:
             conn.close()
@@ -341,6 +389,269 @@ def create_app() -> Flask:
         except CsvConflict as exc:
             flash(f"重核失败，原有核定结果保留：{exc}", "error")
             _log_failure("recheck", f"账套重核被拒（回滚）：{exc}")
+            return redirect(url_for("index"))
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------
+    @app.route("/supplements/upload", methods=["POST"])
+    def upload_supplement():
+        """分炉补报上传：先暂存；同账套同炉重传以新文件整份替换。"""
+        furnace_code = (request.form.get("furnace_code") or "").strip()
+        file = request.files.get("csv_file")
+        if not furnace_code:
+            flash("补报失败：请先选择炉号。", "error")
+            return redirect(url_for("index"))
+        if not file or not file.filename:
+            flash("补报失败：请选择要上传的 CSV 文件。", "error")
+            return redirect(url_for("index"))
+
+        conn = db.get_conn()
+        try:
+            cur_lid = db.current_ledger_id(conn)
+            if cur_lid is None:
+                flash("补报失败：尚未导入任何账套。", "error")
+                return redirect(url_for("index"))
+            known = {
+                r["code"] for r in conn.execute(
+                    "SELECT code FROM furnaces WHERE ledger_id = ?", (cur_lid,)
+                ).fetchall()
+            }
+            if furnace_code not in known:
+                flash(f"补报失败：现行账套中不存在炉号 {furnace_code}。", "error")
+                return redirect(url_for("index"))
+            try:
+                content = file.read()
+                parsed = csvutil.parse_supplement_csv(
+                    content, furnace_code, known
+                )
+            except csvutil.CsvError as exc:
+                flash(f"补报 CSV 校验未通过，暂存区未改动：{exc}", "error")
+                _log_failure(
+                    "supplement_upload",
+                    f"账套#{cur_lid} 炉 {furnace_code} 文件 {file.filename} 校验失败：{exc}",
+                )
+                return redirect(url_for("index"))
+
+            raw_text = content.decode("utf-8-sig")
+            content_hash = hashlib.sha256(content).hexdigest()
+            with db.transaction(conn):
+                replaced = db.get_supplement(conn, cur_lid, furnace_code) is not None
+                db.replace_supplement(
+                    conn, cur_lid, furnace_code, file.filename,
+                    raw_text, content_hash, parsed,
+                )
+                db.log_event(
+                    conn, "supplement_upload",
+                    f"账套#{cur_lid} 炉 {furnace_code} "
+                    f"{'重传替换' if replaced else '新增'}补报 {file.filename}"
+                    f"（{len(parsed.batches)} 批/{len(parsed.transfers)} 笔转料，暂存）",
+                    True,
+                )
+            flash(
+                f"炉 {furnace_code} 的补报已暂存"
+                f"（{'已按新文件替换旧补报' if replaced else '新增'}）："
+                f"{len(parsed.batches)} 个出货批、{len(parsed.transfers)} 笔转料。"
+                "合账前可继续重传或删除。",
+                "ok",
+            )
+            return redirect(url_for("index"))
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------
+    @app.route("/supplements/delete", methods=["POST"])
+    def delete_supplement():
+        """删除某炉暂存补报（不影响原账套与已生效数据）。"""
+        furnace_code = (request.form.get("furnace_code") or "").strip()
+        conn = db.get_conn()
+        try:
+            cur_lid = db.current_ledger_id(conn)
+            if cur_lid is None:
+                flash("删除失败：尚未导入任何账套。", "error")
+                return redirect(url_for("index"))
+            with db.transaction(conn):
+                existed = db.delete_supplement(conn, cur_lid, furnace_code)
+                if not existed:
+                    raise CsvConflict(f"现行账套没有炉 {furnace_code} 的暂存补报。")
+                db.log_event(
+                    conn, "supplement_delete",
+                    f"账套#{cur_lid} 炉 {furnace_code} 的暂存补报已删除", True,
+                )
+            flash(f"炉 {furnace_code} 的暂存补报已删除，原账套数据不受影响。", "ok")
+            return redirect(url_for("index"))
+        except CsvConflict as exc:
+            flash(f"删除失败：{exc}", "error")
+            _log_failure("supplement_delete",
+                         f"账套#{cur_lid} 炉 {furnace_code} 删除被拒：{exc}")
+            return redirect(url_for("index"))
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------
+    @app.route("/merge/preview")
+    def merge_preview():
+        """合账试算页（只读）：转料核对、平衡复核、求解器预核、签发依据令牌。"""
+        conn = db.get_conn()
+        try:
+            cur_lid = db.current_ledger_id(conn)
+            if cur_lid is None:
+                flash("尚未导入任何账套，无法合账。", "error")
+                return redirect(url_for("index"))
+            merged = merge.build_merged_ledger(conn, cur_lid)
+            supp_rows = db.list_supplements(conn, cur_lid)
+            if not supp_rows:
+                flash("现行账套暂无任何分炉补报，无需合账。", "error")
+                return redirect(url_for("index"))
+
+            basis = merge.build_basis(conn, cur_lid)
+            token = basis_serializer.dumps(basis)
+            balance_tbl = merge.merged_balance_table(merged)
+
+            # 用全部有效签单试跑求解器（试算不写库；期间其他人仍可操作）
+            trial_ok, trial_reason = True, None
+            trial_batch_map, trial_transfer_map = {}, {}
+            if merged.ok:
+                f_inputs, links, t_inputs, reqs = _merged_solver_inputs(merged, conn)
+                try:
+                    result = solve_allocation(f_inputs, links, t_inputs, reqs)
+                    trial_ok = result.ok
+                    trial_reason = result.reason
+                    if result.ok:
+                        trial_batch_map = result.batch_recycled
+                        # 合成转料 id 从 1 开始，与页面 enumerate 对齐
+                        trial_transfer_map = result.transfer_recycled
+                except SolveError as exc:
+                    trial_ok, trial_reason = False, str(exc)
+
+            ledger_row = conn.execute(
+                "SELECT * FROM ledgers WHERE id = ?", (cur_lid,)
+            ).fetchone()
+            return render_template(
+                "merge.html",
+                ledger_row=ledger_row,
+                merged=merged,
+                balance_tbl=balance_tbl,
+                basis=basis,
+                token=token,
+                trial_ok=trial_ok,
+                trial_reason=trial_reason,
+                trial_batch_map=trial_batch_map,
+                trial_transfer_map=trial_transfer_map,
+            )
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------
+    @app.route("/merge/commit", methods=["POST"])
+    def merge_commit():
+        """合账提交：依据未变 + 核对通过 + 重核可行才整体生效，否则退回。"""
+        token = request.form.get("basis_token") or ""
+        try:
+            basis = basis_serializer.loads(token)
+        except (BadSignature, TypeError, ValueError):
+            flash("合账失败：试算依据令牌无效或已过期，请重新打开试算页。", "error")
+            _log_failure("merge_commit", "依据令牌无效")
+            return redirect(url_for("index"))
+
+        conn = db.get_conn()
+        try:
+            cur_lid = db.current_ledger_id(conn)
+            with db.transaction(conn):
+                # 1) 试算依据复核：现行账套 / 补报 / 有效签单任一不同即退回
+                drift = merge.basis_matches(conn, cur_lid, basis)
+                if drift:
+                    raise CsvConflict(drift)
+
+                # 2) 重新取数构建合并账（不用试算页的快照），再跑全部核对
+                merged = merge.build_merged_ledger(conn, cur_lid)
+                if merged.issues:
+                    detail = "；".join(i.detail for i in merged.issues)
+                    raise CsvConflict("转料双向核对未通过：" + detail)
+                if merged.balance_problems:
+                    raise CsvConflict(
+                        "合并账物料平衡不满足："
+                        + "；".join(merged.balance_problems) + "。"
+                    )
+
+                # 3) 用全部有效签单重核
+                f_inputs, links, t_inputs, reqs = _merged_solver_inputs(
+                    merged, conn
+                )
+                result = solve_allocation(f_inputs, links, t_inputs, reqs)
+                if not result.ok:
+                    raise CsvConflict(result.reason or "合并账无可行解。")
+
+                # 4) 落库为新账套（原账套与补报保留；新账套从无补报开始）
+                cur = conn.execute(
+                    "INSERT INTO ledgers(filename, imported_at, is_current, note) "
+                    "VALUES (?, ?, 1, ?)",
+                    (
+                        f"merge-of-ledger-{cur_lid}.csv",
+                        db.utcnow_iso(),
+                        f"合账：基于账套#{cur_lid}，补报炉 "
+                        + "、".join(merged.supplemented_codes),
+                    ),
+                )
+                new_id = cur.lastrowid
+                conn.executemany(
+                    "INSERT INTO furnaces(ledger_id, code, primary_kg, recycled_kg) "
+                    "VALUES (?, ?, ?, ?)",
+                    [(new_id, f.code, f.primary_kg, f.recycled_kg)
+                     for f in merged.furnaces],
+                )
+                conn.executemany(
+                    "INSERT INTO batches(ledger_id, furnace_code, code, weight_kg) "
+                    "VALUES (?, ?, ?, ?)",
+                    [(new_id, b.furnace, b.code, b.weight_kg)
+                     for b in merged.batches],
+                )
+                # 转料逐行插入并记录新行号，供核定明细引用
+                transfer_id_map = {}
+                for i, t in enumerate(merged.transfers, start=1):
+                    tr = conn.execute(
+                        "INSERT INTO transfers(ledger_id, src_furnace, dst_furnace, "
+                        "weight_kg) VALUES (?, ?, ?, ?)",
+                        (new_id, t.src, t.dst, t.weight_kg),
+                    )
+                    transfer_id_map[i] = tr.lastrowid
+                conn.execute(
+                    "UPDATE ledgers SET is_current = 0 WHERE id <> ?", (new_id,)
+                )
+
+                # 5) 核定结果与新账一同生效（合成 id 已与求解输出对齐）
+                db.save_solution(
+                    conn, new_id, True, None,
+                    batch_values=result.batch_recycled.items(),
+                    transfer_values=(
+                        (transfer_id_map[tid], val)
+                        for tid, val in result.transfer_recycled.items()
+                    ),
+                )
+                db.log_event(
+                    conn, "merge_commit",
+                    f"账套#{cur_lid} 合账生效为新账套#{new_id}（补报炉 "
+                    f"{len(merged.supplemented_codes)} 座），核定成功",
+                    True,
+                )
+            flash(
+                f"合账完成：新账套 #{new_id} 与核定结果已一同生效；"
+                f"原账套 #{cur_lid} 及其补报均保留可查。",
+                "ok",
+            )
+            return redirect(url_for("index", ledger=new_id))
+        except CsvConflict as exc:
+            flash(f"本次合账已退回，补报、签单与已生效数据全部保留：{exc}", "error")
+            _log_failure("merge_commit", f"账套#{cur_lid} 合账被拒（回滚）：{exc}")
+            return redirect(url_for("index"))
+        except SolveError as exc:
+            flash(f"合账失败，数据未改动：{exc}", "error")
+            _log_failure("merge_commit", f"账套#{cur_lid} 数据错误（回滚）：{exc}")
+            return redirect(url_for("index"))
+        except Exception as exc:  # 兜底：任何意外错误也必须回滚并提示，不留 500
+            app.logger.exception("merge_commit unexpected error")
+            flash(f"合账失败，数据未改动：{exc}", "error")
+            _log_failure("merge_commit", f"账套#{cur_lid} 异常回滚：{exc}")
             return redirect(url_for("index"))
         finally:
             conn.close()

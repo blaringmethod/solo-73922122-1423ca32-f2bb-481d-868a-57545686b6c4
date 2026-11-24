@@ -41,6 +41,70 @@
   {% endif %}
 </section>
 
+<!-- 1b. 分炉补报（暂存） -->
+{% if current_ledger_id and view_ledger_id == current_ledger_id %}
+<section class="card">
+  <h2>①-补 分炉补报（暂存，不改动原账）
+    <span class="tag">沿用相同 6 列 CSV · 同账套同炉重传以新文件为准 · 旧账套补报只适用原账套</span>
+  </h2>
+  <form method="post" action="{{ url_for('upload_supplement') }}" enctype="multipart/form-data"
+        class="inline" style="flex-wrap:wrap">
+    <label>选择现行账套炉号：
+      <select name="furnace_code" required>
+        {% for f in furnaces %}
+        <option value="{{ f.code }}" {% if f.code in supp_codes %}disabled{% endif %}>
+          {{ f.code }}{% if f.code in supp_codes %}（已暂存，可重传替换）{% endif %}
+        </option>
+        {% endfor %}
+      </select>
+    </label>
+    <input type="file" name="csv_file" accept=".csv,text/csv" required>
+    <button type="submit">上传补报（暂存）</button>
+  </form>
+  <p class="small muted" style="margin:8px 0 0">
+    补报文件须含所选炉自身的一条 furnace 行、该炉完整的出货批与进出转料明细，并满足该炉总进料＝总出料；
+    转料有变动时两端炉都要补报，合账时按方向和重量核对笔数。
+  </p>
+
+  {% if supp_views %}
+  <div class="table-wrap" style="margin-top:12px">
+  <table>
+    <thead>
+      <tr>
+        <th>炉号</th><th>来源文件</th><th class="num">外购原生/再生(kg)</th>
+        <th class="num">出货批数</th><th class="num">转料笔数</th><th>上传时间(UTC)</th><th>操作</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for v in supp_views %}
+      <tr>
+        <td class="code">{{ v.row.furnace_code }}</td>
+        <td class="small">{{ v.row.filename }}</td>
+        <td class="num">{{ v.primary_kg }} / {{ v.recycled_kg }}</td>
+        <td class="num">{{ v.batches|length }}</td>
+        <td class="num">{{ v.transfers|length }}</td>
+        <td class="small">{{ v.row.uploaded_at }}</td>
+        <td>
+          <form class="inline" method="post" action="{{ url_for('delete_supplement') }}"
+                onsubmit="return confirm('确认删除炉 {{ v.row.furnace_code }} 的暂存补报？原账套不受影响。');">
+            <input type="hidden" name="furnace_code" value="{{ v.row.furnace_code }}">
+            <button class="danger" type="submit">删除补报</button>
+          </form>
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  <form method="get" action="{{ url_for('merge_preview') }}" style="margin-top:12px">
+    <button type="submit">进入合账试算（{{ supp_views|length }} 炉已补报）</button>
+  </form>
+  {% else %}
+  <p class="small muted" style="margin-bottom:0">暂无暂存补报。</p>
+  {% endif %}
+</section>
+{% endif %}
+
 {% if not ledger_row %}
   <section class="card"><p class="muted">尚未导入账套。请先上传 CSV（可使用仓库 <span class="code">data/sample_ledger.csv</span> 示例文件）。</p></section>
 {% else %}

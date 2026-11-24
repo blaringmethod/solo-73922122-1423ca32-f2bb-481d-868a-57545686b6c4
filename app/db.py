@@ -96,9 +96,48 @@ CREATE TABLE IF NOT EXISTS audit_log (
     success INTEGER NOT NULL
 );
 
+-- 分炉补报（暂存）：同一账套内同一炉号至多一份，重传以新文件为准（整份替换）。
+-- 补报绑定账套：旧账套的补报只适用于原账套，合账产生的新账套从无补报开始。
+CREATE TABLE IF NOT EXISTS supplements (
+    id INTEGER PRIMARY KEY,
+    ledger_id INTEGER NOT NULL REFERENCES ledgers(id) ON DELETE CASCADE,
+    furnace_code TEXT NOT NULL,
+    filename TEXT NOT NULL,
+    raw_csv TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    uploaded_at TEXT NOT NULL,
+    UNIQUE (ledger_id, furnace_code)
+);
+
+-- 每份补报恰好含一个 furnace 行（1:1），炉号与 supplements.furnace_code 一致。
+CREATE TABLE IF NOT EXISTS supplement_furnaces (
+    supplement_id INTEGER PRIMARY KEY REFERENCES supplements(id) ON DELETE CASCADE,
+    primary_kg INTEGER NOT NULL CHECK (primary_kg >= 0),
+    recycled_kg INTEGER NOT NULL CHECK (recycled_kg >= 0)
+);
+
+CREATE TABLE IF NOT EXISTS supplement_batches (
+    id INTEGER PRIMARY KEY,
+    supplement_id INTEGER NOT NULL REFERENCES supplements(id) ON DELETE CASCADE,
+    code TEXT NOT NULL,
+    weight_kg INTEGER NOT NULL CHECK (weight_kg >= 0)
+);
+
+CREATE TABLE IF NOT EXISTS supplement_transfers (
+    id INTEGER PRIMARY KEY,
+    supplement_id INTEGER NOT NULL REFERENCES supplements(id) ON DELETE CASCADE,
+    src_furnace TEXT NOT NULL,
+    dst_furnace TEXT NOT NULL,
+    weight_kg INTEGER NOT NULL CHECK (weight_kg >= 0),
+    CHECK (src_furnace <> dst_furnace)
+);
+
 CREATE INDEX IF NOT EXISTS idx_batches_ledger ON batches(ledger_id);
 CREATE INDEX IF NOT EXISTS idx_transfers_ledger ON transfers(ledger_id);
 CREATE INDEX IF NOT EXISTS idx_cert_active ON certificates(active);
+CREATE INDEX IF NOT EXISTS idx_supplements_ledger ON supplements(ledger_id);
+CREATE INDEX IF NOT EXISTS idx_supp_batches ON supplement_batches(supplement_id);
+CREATE INDEX IF NOT EXISTS idx_supp_transfers ON supplement_transfers(supplement_id);
 """
 
 
@@ -216,3 +255,108 @@ def solution_details(
         (solution_id,),
     ).fetchall()
     return sb, st
+
+
+# ---------------------------------------------------------------------------
+# 分炉补报（暂存）
+# ---------------------------------------------------------------------------
+def list_supplements(conn: sqlite3.Connection, ledger_id: int) -> List[sqlite3.Row]:
+    """返回该账套全部暂存补报（按炉号排序）。"""
+    return conn.execute(
+        "SELECT * FROM supplements WHERE ledger_id = ? ORDER BY furnace_code",
+        (ledger_id,),
+    ).fetchall()
+
+
+def get_supplement(
+    conn: sqlite3.Connection, ledger_id: int, furnace_code: str
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM supplements WHERE ledger_id = ? AND furnace_code = ?",
+        (ledger_id, furnace_code),
+    ).fetchone()
+
+
+def supplement_batches(
+    conn: sqlite3.Connection, supplement_id: int
+) -> List[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM supplement_batches WHERE supplement_id = ? ORDER BY code",
+        (supplement_id,),
+    ).fetchall()
+
+
+def supplement_transfers(
+    conn: sqlite3.Connection, supplement_id: int
+) -> List[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM supplement_transfers "
+        "WHERE supplement_id = ? ORDER BY id",
+        (supplement_id,),
+    ).fetchall()
+
+
+def supplement_furnace(
+    conn: sqlite3.Connection, supplement_id: int
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM supplement_furnaces WHERE supplement_id = ?",
+        (supplement_id,),
+    ).fetchone()
+
+
+def replace_supplement(
+    conn: sqlite3.Connection,
+    ledger_id: int,
+    furnace_code: str,
+    filename: str,
+    raw_csv: str,
+    content_hash: str,
+    parsed,
+) -> int:
+    """整份替换（无则插入）某账套某炉的暂存补报。调用方须已在事务中。"""
+    old = get_supplement(conn, ledger_id, furnace_code)
+    if old:
+        conn.execute("DELETE FROM supplements WHERE id = ?", (old["id"],))
+    cur = conn.execute(
+        "INSERT INTO supplements(ledger_id, furnace_code, filename, raw_csv, "
+        "content_hash, uploaded_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (ledger_id, furnace_code, filename, raw_csv, content_hash, utcnow_iso()),
+    )
+    sid = cur.lastrowid
+    conn.execute(
+        "INSERT INTO supplement_furnaces(supplement_id, primary_kg, recycled_kg) "
+        "VALUES (?, ?, ?)",
+        (sid, parsed.furnace["primary_kg"], parsed.furnace["recycled_kg"]),
+    )
+    conn.executemany(
+        "INSERT INTO supplement_batches(supplement_id, code, weight_kg) "
+        "VALUES (?, ?, ?)",
+        [(sid, b["code"], b["weight_kg"]) for b in parsed.batches],
+    )
+    conn.executemany(
+        "INSERT INTO supplement_transfers(supplement_id, src_furnace, dst_furnace, "
+        "weight_kg) VALUES (?, ?, ?, ?)",
+        [(sid, t["src"], t["dst"], t["weight_kg"]) for t in parsed.transfers],
+    )
+    return sid
+
+
+def delete_supplement(
+    conn: sqlite3.Connection, ledger_id: int, furnace_code: str
+) -> bool:
+    """删除暂存补报；返回是否删到了记录。调用方须已在事务中。"""
+    row = get_supplement(conn, ledger_id, furnace_code)
+    if not row:
+        return False
+    conn.execute("DELETE FROM supplements WHERE id = ?", (row["id"],))
+    return True
+
+
+def active_certificate_digest(conn: sqlite3.Connection) -> str:
+    """全部有效签单的稳定指纹（试算依据之一）。"""
+    rows = conn.execute(
+        "SELECT batch_code, min_recycled_kg FROM certificates "
+        "WHERE active = 1 ORDER BY batch_code"
+    ).fetchall()
+    return "|".join(f"{r['batch_code']}:{r['min_recycled_kg']}" for r in rows)

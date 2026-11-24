@@ -74,6 +74,12 @@ input[type="number"], input[type="text"] {
   width: 120px; padding: 6px 8px; border: 1px solid var(--line);
   border-radius: 6px; font-size: 13px;
 }
+select {
+  padding: 6px 8px; border: 1px solid var(--line);
+  border-radius: 6px; font-size: 13px; min-width: 180px;
+  background: #fff;
+}
+select option:disabled { color: var(--muted); }
 input[type="file"] { font-size: 13px; }
 button, .btn {
   background: var(--blue); color: #fff; border: 0; border-radius: 6px;

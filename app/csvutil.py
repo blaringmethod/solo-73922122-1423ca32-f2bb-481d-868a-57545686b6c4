@@ -41,6 +41,14 @@ class ParsedLedger:
     transfers: List[dict] = field(default_factory=list)       # src, dst, weight
 
 
+@dataclass
+class ParsedSupplement:
+    """单炉补报：恰好一个 furnace 行，furnace 即审核页所选炉号。"""
+    furnace: dict = field(default_factory=dict)               # code, primary, recycled
+    batches: List[dict] = field(default_factory=list)         # furnace, code, weight
+    transfers: List[dict] = field(default_factory=list)       # src, dst, weight
+
+
 def _parse_int(raw: str, field_name: str, line_no: int,
                allow_blank: bool = False, positive: bool = False) -> int:
     raw = (raw or "").strip()
@@ -172,3 +180,131 @@ def parse_ledger_csv(content: bytes) -> ParsedLedger:
 
 def ledger_summary(parsed: ParsedLedger) -> Tuple[int, int, int]:
     return len(parsed.furnaces), len(parsed.batches), len(parsed.transfers)
+
+
+def parse_supplement_csv(
+    content: bytes, furnace_code: str, known_furnaces: set
+) -> ParsedSupplement:
+    """解析分炉补报 CSV（沿用账套 6 列格式）。
+
+    规则：
+    - 表头与整账 CSV 完全相同；恰好一条 furnace 行，炉号必须等于审核页所选炉号；
+    - 所有 batch 的归属炉、所有 transfer 的源炉都必须是该炉号；
+      transfer 的对端炉号必须在现行账套内（对端是否已补报由合账引擎核对）；
+    - 出货批号在本补报内唯一；
+    - 该炉总进料（外购 + 转入）== 总出料（出货批 + 转出），不平衡直接拒收。
+    """
+    if not content or not content.strip():
+        raise CsvError("补报文件为空。")
+    try:
+        text = content.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        raise CsvError("文件不是 UTF-8 编码，请另存为 UTF-8 CSV 后重试。")
+
+    reader = csv.reader(io.StringIO(text))
+    rows = list(reader)
+    if len(rows) < 2:
+        raise CsvError("CSV 只有表头或无数据行。")
+    header = [h.strip() for h in rows[0]]
+    missing = [c for c in REQUIRED_COLUMNS if c not in header]
+    if missing:
+        raise CsvError("表头缺少必需列：" + "、".join(missing)
+                       + f"。完整列：{', '.join(REQUIRED_COLUMNS)}")
+    idx = {c: header.index(c) for c in REQUIRED_COLUMNS}
+
+    parsed = ParsedSupplement()
+    seen_batches: Dict[str, int] = {}
+    furnace_rows = 0
+
+    for line_no, row in enumerate(rows[1:], start=2):
+        if not row or all((c or "").strip() == "" for c in row):
+            continue
+        if len(row) < len(header):
+            row = row + [""] * (len(header) - len(row))
+        rtype = row[idx["record_type"]].strip().lower()
+        if rtype not in VALID_TYPES:
+            raise CsvError(
+                f"第 {line_no} 行：record_type 必须是 furnace/batch/transfer，"
+                f"收到 {rtype!r}。"
+            )
+        furnace = row[idx["furnace"]].strip()
+        ref = row[idx["ref"]].strip()
+        if not furnace:
+            raise CsvError(f"第 {line_no} 行：furnace（炉号）不能为空。")
+
+        if rtype == "furnace":
+            if furnace != furnace_code:
+                raise CsvError(
+                    f"第 {line_no} 行：补报炉号必须为 {furnace_code}，"
+                    f"文件内却出现 furnace 行 {furnace}；分炉补报只能含所选炉本身。"
+                )
+            furnace_rows += 1
+            if furnace_rows > 1:
+                raise CsvError(
+                    f"第 {line_no} 行：分炉补报只能包含一条 furnace 行（炉 {furnace_code}）。"
+                )
+            primary = _parse_int(row[idx["primary_kg"]], "primary_kg", line_no,
+                                 allow_blank=True)
+            recycled = _parse_int(row[idx["recycled_kg"]], "recycled_kg", line_no,
+                                  allow_blank=True)
+            parsed.furnace = {
+                "code": furnace_code, "primary_kg": primary, "recycled_kg": recycled,
+            }
+
+        elif rtype == "batch":
+            if furnace != furnace_code:
+                raise CsvError(
+                    f"第 {line_no} 行：batch 归属炉 {furnace} 与所选补报炉 {furnace_code} 不一致。"
+                )
+            if not ref:
+                raise CsvError(f"第 {line_no} 行：batch 记录的 ref（出货批号）不能为空。")
+            weight = _parse_int(row[idx["weight_kg"]], "weight_kg", line_no)
+            if ref in seen_batches:
+                raise CsvError(f"第 {line_no} 行：出货批号 {ref} 重复定义"
+                               f"（首次见第 {seen_batches[ref]} 行）。")
+            seen_batches[ref] = line_no
+            parsed.batches.append({
+                "furnace": furnace_code, "code": ref, "weight_kg": weight,
+            })
+
+        else:  # transfer
+            if not ref:
+                raise CsvError(f"第 {line_no} 行：transfer 记录的 ref（目标炉号）不能为空。")
+            # 每炉补报须含该炉完整的进出转料：源或目标至少一端是本炉
+            if furnace != furnace_code and ref != furnace_code:
+                raise CsvError(
+                    f"第 {line_no} 行：转料 {furnace}->{ref} 与补报炉 {furnace_code} 无关，"
+                    f"分炉补报只能报该炉的进出转料。"
+                )
+            if furnace == ref:
+                raise CsvError(f"第 {line_no} 行：余料转料的源炉与目标炉不能相同（{furnace}）。")
+            other = ref if furnace == furnace_code else furnace
+            if other not in known_furnaces:
+                raise CsvError(
+                    f"第 {line_no} 行：转料对端炉 {other} 不在现行账套的炉号清单内。"
+                )
+            weight = _parse_int(row[idx["weight_kg"]], "weight_kg", line_no)
+            parsed.transfers.append({
+                "src": furnace, "dst": ref, "weight_kg": weight,
+            })
+
+    if furnace_rows == 0:
+        raise CsvError(f"补报中缺少炉 {furnace_code} 的 furnace 行（外购原生/再生料）。")
+
+    # ---------- 该炉物料平衡：总进料 == 总出料 ----------
+    tin = parsed.furnace["primary_kg"] + parsed.furnace["recycled_kg"]
+    tout = 0
+    for t in parsed.transfers:
+        if t["src"] == furnace_code:
+            tout += t["weight_kg"]
+        else:  # 本炉为目标端 -> 转入余料
+            tin += t["weight_kg"]
+    for b in parsed.batches:
+        tout += b["weight_kg"]
+    if tin != tout:
+        raise CsvError(
+            f"炉 {furnace_code} 物料平衡不满足：总进料 {tin} kg ≠ 总出料 {tout} kg"
+            f"（差 {tin - tout:+d} kg）。"
+        )
+
+    return parsed
